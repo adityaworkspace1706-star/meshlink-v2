@@ -213,26 +213,54 @@ function startBluetooth() {
     const rssi = peripheral.rssi || -70;
 
     console.log(`BT: Found ${name} (${rssi} dBm)`);
-    addOrUpdatePeer(peerId, peerName, rssi, false, 'ble');
-    mainWin?.webContents.send('peer-found', getPeer(peerId));
 
-    // Connect to exchange WebSocket port info
+    // Mark ONLINE immediately when found — device is right here
+    addOrUpdatePeer(peerId, peerName, rssi, true, 'ble');
+    mainWin?.webContents.send('peer-online', getPeer(peerId));
+
+    // Connect via GATT for full messaging
     connectBLEPeer(peripheral, peerId, peerName);
   });
 }
 
+// BLE characteristic store for direct messaging
+const bleChars = new Map(); // peerId → txChar
+
 function connectBLEPeer(peripheral, peerId, peerName) {
   peripheral.connect((err) => {
-    if (err) { console.log('BLE connect error:', err); return; }
+    if (err) {
+      console.log('BLE connect error:', err);
+      // Still show as online even if GATT fails — we can see it
+      addOrUpdatePeer(peerId, peerName, peripheral.rssi || -70, true, 'ble');
+      mainWin?.webContents.send('peer-online', getPeer(peerId));
+      return;
+    }
+
+    // Mark online as soon as connected
+    addOrUpdatePeer(peerId, peerName, peripheral.rssi || -70, true, 'ble');
+    mainWin?.webContents.send('peer-online', getPeer(peerId));
 
     peripheral.discoverSomeServicesAndCharacteristics(
       [MESH_SERVICE_UUID],
       [MESH_CHAR_TX_UUID, MESH_CHAR_RX_UUID],
       (err, services, chars) => {
-        if (err || !chars.length) return;
+        if (err || !chars || !chars.length) {
+          console.log('GATT service discovery failed:', err);
+          return;
+        }
 
         const txChar = chars.find(c => c.uuid === MESH_CHAR_TX_UUID);
         const rxChar = chars.find(c => c.uuid === MESH_CHAR_RX_UUID);
+
+        // Store TX char for sending messages directly via BLE
+        if (txChar) {
+          bleChars.set(peerId, txChar);
+          // Send hello immediately
+          const hello = JSON.stringify({ type: 'hello', id: myId, name: myName });
+          txChar.write(Buffer.from(hello), true, () => {});
+          // Deliver any queued messages
+          deliverSCF(peerId);
+        }
 
         if (rxChar) {
           rxChar.subscribe((err) => {
@@ -240,20 +268,13 @@ function connectBLEPeer(peripheral, peerId, peerName) {
             rxChar.on('data', (data) => {
               try {
                 const msg = JSON.parse(data.toString());
-                // Exchange WS port for full connection
-                if (msg.type === 'ws-info') {
-                  const wsUrl = `ws://${msg.ip}:${WS_PORT}`;
-                  const ws = new WebSocket(wsUrl, { timeout: 3000 });
-                  ws.on('open', () => {
-                    ws.send(JSON.stringify({ type: 'hello', id: myId, name: myName }));
-                    wsClients.set(peerId, ws);
-                    addOrUpdatePeer(peerId, peerName, peripheral.rssi, true, 'ble+ws');
-                    deliverSCF(peerId);
-                    mainWin?.webContents.send('peer-online', getPeer(peerId));
-                  });
-                  ws.on('message', (d) => {
-                    try { handleIncomingPacket(JSON.parse(d.toString()), peerId); } catch(e) {}
-                  });
+                // Handle hello from phone
+                if (msg.type === 'hello') {
+                  addOrUpdatePeer(peerId, msg.name || peerName,
+                    peripheral.rssi || -70, true, 'ble');
+                  mainWin?.webContents.send('peer-online', getPeer(peerId));
+                } else {
+                  handleIncomingPacket(msg, peerId);
                 }
               } catch(e) {}
             });
@@ -327,7 +348,19 @@ function handleIncomingPacket(pkt, fromId) {
 }
 
 // ── Send ──────────────────────────────────────────────
+// BLE chars store
 function sendToePeer(peerId, pkt) {
+  const data = JSON.stringify(pkt);
+  // Try BLE first
+  const txChar = bleChars.get(peerId);
+  if (txChar) {
+    try { txChar.write(Buffer.from(data), true, () => {}); return true; } catch(e) {}
+  }
+  // Try WebSocket
+  const ws = wsClients.get(peerId);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(data); return true; } catch(e) {}
+  }
   const ws = wsClients.get(peerId);
   if (ws && ws.readyState === WebSocket.OPEN) {
     try { ws.send(JSON.stringify(pkt)); return true; } catch(e) {}
@@ -336,6 +369,11 @@ function sendToePeer(peerId, pkt) {
 }
 
 function broadcastToAll(pkt, exceptId) {
+  const data = JSON.stringify(pkt);
+  // BLE peers
+  bleChars.forEach((txChar, id) => {
+    if (id !== exceptId) { try { txChar.write(Buffer.from(data), true, () => {}); } catch(e) {} }
+  });
   wsClients.forEach((ws, id) => {
     if (id !== exceptId && ws.readyState === WebSocket.OPEN) {
       try { ws.send(JSON.stringify(pkt)); } catch(e) {}
